@@ -1,0 +1,502 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include "esp_wifi.h"
+#include "esp_log.h"
+#include <ArduinoJson.h>  // <-- make sure library is installed
+
+// ------------------ CONFIG ------------------
+#define LED_PIN 2
+#define MAX_SSIDS 20
+
+const char* ap_ssid = "ESP32_Setup";
+const char* ap_pass = "12345678";
+
+// MQTT (HiveMQ Cloud)
+const char* mqtt_server = "182af61f63334ba9b5d5d43d70724571.s1.eu.hivemq.cloud";
+const int   mqtt_port   = 8883;
+const char* mqtt_user   = "harsh";
+const char* mqtt_pass   = "It123456";
+
+const char* topic_led_control = "device/led/control";
+const char* topic_led_status  = "device/led/status";
+const char* topic_wifi_reset  = "device/wifi/reset";
+const char* topic_wifi_update = "device/wifi/update";  // new
+
+// ------------------ GLOBALS ------------------
+WebServer   server(80);
+DNSServer   dnsServer;
+Preferences prefs;
+
+WiFiClientSecure espClient;
+PubSubClient     client(espClient);
+
+String ssidList[MAX_SSIDS];
+int    ssidCount = 0;
+
+// WiFi state machine
+enum WifiState {
+  WIFI_STATE_CONNECTING,
+  WIFI_STATE_CONNECTED,
+  WIFI_STATE_AP
+};
+
+WifiState wifiState = WIFI_STATE_CONNECTING;
+bool      hasSavedCredentials = false;
+
+String savedSsid;
+String savedPass;
+
+unsigned long lastWifiAttempt   = 0;
+unsigned long wifiRetryInterval = 7000;  // 7s
+int           wifiRetries       = 0;
+const int     WIFI_MAX_RETRIES  = 5;
+
+unsigned long lastHeartbeat     = 0;
+unsigned long lastMqttAttempt   = 0;
+const  unsigned long mqttRetryInterval = 5000;
+
+// ------------- LED HELPERS -------------
+void setLedOn()  { digitalWrite(LED_PIN, LOW); }
+void setLedOff() { digitalWrite(LED_PIN, HIGH); }
+
+// ------------------ WIFI SCAN (SAFE) ------------------
+void scanWiFi() {
+  Serial.println("[SCAN] Scanning WiFi (non-intrusive)...");
+  int n = WiFi.scanNetworks();
+  ssidCount = min(n, MAX_SSIDS);
+
+  for (int i = 0; i < ssidCount; i++) {
+    ssidList[i] = WiFi.SSID(i);
+    Serial.println("[FOUND] " + ssidList[i]);
+  }
+
+  WiFi.scanDelete();
+}
+
+// ------------------ HTML HELPERS ------------------
+String htmlHeader() {
+  return
+    "<!DOCTYPE html><html><head>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<title>ESP32 WiFi Setup</title>"
+    "<style>"
+    "body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+    "background:#0f172a;color:#e5e7eb;display:flex;align-items:center;justify-content:center;"
+    "min-height:100vh;padding:16px;}"
+    ".card{background:#020617;border-radius:16px;padding:20px;width:100%;max-width:420px;"
+    "box-shadow:0 20px 40px rgba(15,23,42,0.8);border:1px solid #1f2937;}"
+    "h1{font-size:1.3rem;margin-bottom:0.5rem;color:#f9fafb;}"
+    "p{margin-top:0;margin-bottom:1rem;color:#9ca3af;font-size:0.9rem;}"
+    ".badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:0.7rem;"
+    "background:#111827;color:#a5b4fc;border:1px solid #1f2937;margin-bottom:12px;}"
+    ".btn{display:inline-block;background:#3b82f6;border:none;color:white;border-radius:999px;"
+    "padding:10px 16px;font-size:0.85rem;font-weight:600;cursor:pointer;margin-top:10px;}"
+    ".btn-outline{background:transparent;border:1px solid #4b5563;color:#e5e7eb;}"
+    "input[type='password'],input[type='text']{width:100%;padding:8px 10px;border-radius:8px;"
+    "border:1px solid #374151;background:#020617;color:#e5e7eb;font-size:0.85rem;margin-top:4px;margin-bottom:8px;}"
+    "label{font-size:0.8rem;color:#9ca3af;}"
+    ".ssid-list{max-height:200px;overflow-y:auto;border-radius:10px;border:1px solid #1f2937;"
+    "background:#020617;padding:8px;margin:8px 0;}"
+    ".ssid-item{display:flex;align-items:center;padding:6px 4px;font-size:0.85rem;border-radius:6px;cursor:pointer;}"
+    ".ssid-item:hover{background:#111827;}"
+    "input[type='radio']{margin-right:8px;}"
+    ".footer{margin-top:1.2rem;font-size:0.7rem;color:#6b7280;text-align:center;}"
+    "a{color:#3b82f6;text-decoration:none;font-size:0.8rem;}"
+    "</style></head><body><div class='card'>";
+}
+
+String htmlFooter() {
+  return "<div class='footer'>ESP32 WiFi Provisioning</div></div></body></html>";
+}
+
+String htmlRoot() {
+  String page = htmlHeader();
+  page += "<span class='badge'>SETUP MODE</span>";
+  page += "<h1>Connect ESP32 to WiFi</h1>";
+  page += "<p>Select a network from the list or use manual entry.</p>";
+  page += "<form action='/connect' method='POST'>";
+
+  page += "<div class='ssid-list'>";
+  if (ssidCount == 0) {
+    page += "<div style='font-size:0.8rem;color:#6b7280;'>No networks found. Refresh page.</div>";
+  } else {
+    for (int i = 0; i < ssidCount; i++) {
+      page += "<div class='ssid-item' onclick=\"this.querySelector('input').checked=true;\">";
+      page += "<input type='radio' name='ssid' value='" + ssidList[i] + "'>";
+      page += ssidList[i];
+      page += "</div>";
+    }
+  }
+  page += "</div>";
+
+  page += "<label>WiFi Password</label>";
+  page += "<input type='password' name='pass' placeholder='Enter password'>";
+
+  page += "<button class='btn' type='submit'>Save & Connect</button>";
+  page += "&nbsp;<a href='/manual' class='btn btn-outline'>Manual Entry</a>";
+  page += "</form>";
+  page += htmlFooter();
+  return page;
+}
+
+String htmlManual() {
+  String page = htmlHeader();
+  page += "<span class='badge'>MANUAL</span>";
+  page += "<h1>Manual WiFi Entry</h1>";
+  page += "<p>Enter SSID and password of your WiFi network.</p>";
+  page += "<form action='/connect' method='POST'>";
+  page += "<label>WiFi SSID</label>";
+  page += "<input type='text' name='ssid' placeholder='MyHomeWiFi'>";
+  page += "<label>Password</label>";
+  page += "<input type='password' name='pass' placeholder='********'>";
+  page += "<button class='btn' type='submit'>Save & Connect</button>";
+  page += "</form>";
+  page += htmlFooter();
+  return page;
+}
+
+// ------------------ HTTP HANDLERS ------------------
+void handleRoot()    { server.send(200, "text/html", htmlRoot()); }
+void handleManual()  { server.send(200, "text/html", htmlManual()); }
+
+// Save WiFi from AP page and reboot
+void handleConnect() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+
+  Serial.println("[INPUT] SSID (web): " + ssid);
+
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+
+  String page = htmlHeader();
+  page += "<h1>Credentials Saved</h1>";
+  page += "<p>Device will reboot and try to connect to WiFi.</p>";
+  page += htmlFooter();
+  server.send(200, "text/html", page);
+
+  delay(1500);
+  ESP.restart();
+}
+
+// ------------------ FACTORY RESET ------------------
+void factoryReset() {
+  Serial.println("[FACTORY RESET] Clearing all saved data...");
+  prefs.begin("wifi", false);
+  prefs.clear();
+  prefs.end();
+  delay(500);
+  ESP.restart();
+}
+
+// ------------------ WIFI CREDS ------------------
+bool loadSavedCredentials() {
+  prefs.begin("wifi", true);
+  savedSsid = prefs.getString("ssid", "");
+  savedPass = prefs.getString("pass", "");
+  prefs.end();
+
+  if (savedSsid.length() == 0) {
+    Serial.println("[INFO] No saved WiFi credentials");
+    return false;
+  }
+  Serial.println("[INFO] Found saved WiFi: " + savedSsid);
+  return true;
+}
+
+// ------------------ WIFI UPDATE via MQTT ------------------
+void handleWifiUpdateJson(const String& json) {
+  Serial.println("[MQTT] WiFi update JSON: " + json);
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    Serial.print("[MQTT] JSON parse error: ");
+    Serial.println(err.f_str());
+    client.publish(topic_led_status, "WiFi update JSON error");
+    return;
+  }
+
+  const char* newSsid = doc["ssid"];
+  const char* newPass = doc["password"];
+
+  if (!newSsid || !newPass || strlen(newSsid) == 0) {
+    Serial.println("[MQTT] Missing ssid/password fields");
+    client.publish(topic_led_status, "WiFi update invalid");
+    return;
+  }
+
+  Serial.println(String("[MQTT] Saving new WiFi from MQTT: ") + newSsid);
+
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", String(newSsid));
+  prefs.putString("pass", String(newPass));
+  prefs.end();
+
+  client.publish(topic_led_status, "WiFi Updated via MQTT, rebooting");
+  delay(500);
+  ESP.restart();
+}
+
+// ------------------ MQTT CALLBACK ------------------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  String t = String(topic);
+  Serial.println("[MQTT] Topic: " + t + " | Payload: " + msg);
+
+  if (t == topic_led_control) {
+    if (msg == "ON") {
+      setLedOn();
+      client.publish(topic_led_status, "LED ON");
+    } else if (msg == "OFF") {
+      setLedOff();
+      client.publish(topic_led_status, "LED OFF");
+    }
+  }
+
+  if (t == topic_wifi_reset) {
+    Serial.println("[MQTT] WiFi Reset requested");
+    factoryReset();
+  }
+
+  if (t == topic_wifi_update) {
+    Serial.println("[MQTT] WiFi Update requested");
+    handleWifiUpdateJson(msg);
+  }
+}
+
+// ------------------ MQTT CONNECT (throttled) ------------------
+void ensureMqttConnected() {
+  if (client.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastMqttAttempt < mqttRetryInterval) return;
+  lastMqttAttempt = now;
+
+  Serial.println("[MQTT] Connecting...");
+  String clientId = "ESP32_" + String(random(1000, 9999));
+  if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+    Serial.println("[MQTT] Connected");
+    client.subscribe(topic_led_control);
+    client.subscribe(topic_wifi_reset);
+    client.subscribe(topic_wifi_update);
+    client.publish(topic_led_status, "Device Online");
+  } else {
+    Serial.print("[MQTT] Failed, state = ");
+    Serial.println(client.state());
+  }
+}
+
+// ------------------ WIFI FIRST CONNECT ------------------
+void startWifiConnectBlockingFirstAttempt() {
+  if (savedSsid.length() == 0) {
+    Serial.println("[WIFI] No SSID to connect");
+    return;
+  }
+
+  Serial.println("[WIFI] First attempt to connect (blocking) to: " + savedSsid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+  delay(200);
+
+  int timeout = 20; // ~10s
+  while (WiFi.status() != WL_CONNECTED && timeout--) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WIFI] Connected on first attempt");
+    Serial.print("[IP] ");
+    Serial.println(WiFi.localIP());
+    wifiState = WIFI_STATE_CONNECTED;
+
+    espClient.setInsecure();
+    client.setServer(mqtt_server, mqtt_port);
+    client.setCallback(mqttCallback);
+  } else {
+    Serial.println("\n[WIFI] First attempt failed, going to AP mode");
+    wifiState = WIFI_STATE_AP;
+  }
+}
+
+// Decode WiFi.status for debug
+void printWifiError(wl_status_t status) {
+  if (status == WL_CONNECT_FAILED) {
+    Serial.println("[ERROR] WiFi: Wrong password (WL_CONNECT_FAILED)");
+  } else if (status == WL_NO_SSID_AVAIL) {
+    Serial.println("[ERROR] WiFi: SSID not found (WL_NO_SSID_AVAIL)");
+  } else if (status == WL_DISCONNECTED) {
+    Serial.println("[ERROR] WiFi: Disconnected (WL_DISCONNECTED)");
+  } else {
+    Serial.print("[INFO] WiFi status code: ");
+    Serial.println((int)status);
+  }
+}
+
+// Non‑blocking reconnects after we were connected
+void handleWifiConnecting() {
+  wl_status_t status = WiFi.status();
+
+  if (status == WL_CONNECTED) {
+    Serial.println("[WIFI] Reconnected. IP: " + WiFi.localIP().toString());
+    wifiState = WIFI_STATE_CONNECTED;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastWifiAttempt >= wifiRetryInterval) {
+    lastWifiAttempt = now;
+    wifiRetries++;
+
+    Serial.print("[WIFI] Retry #");
+    Serial.print(wifiRetries);
+    Serial.print(" status=");
+    Serial.println((int)status);
+    printWifiError(status);
+
+    if (wifiRetries >= WIFI_MAX_RETRIES) {
+      Serial.println("[WIFI] Max retries reached, going to AP mode");
+      wifiState = WIFI_STATE_AP;
+
+      WiFi.disconnect(true);
+      delay(200);
+      WiFi.mode(WIFI_OFF);
+      delay(200);
+      return;
+    }
+
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+    delay(200);
+  }
+}
+
+// ------------------ START AP MODE ------------------
+void startAPMode() {
+  Serial.println("[MODE] AP MODE (Provisioning)");
+
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.mode(WIFI_AP);
+  delay(200);
+
+  WiFi.softAP(ap_ssid, ap_pass);
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.print("[AP IP] ");
+  Serial.println(apIP);
+
+  scanWiFi();
+
+  dnsServer.start(53, "*", apIP);
+
+  server.on("/", handleRoot);
+  server.on("/manual", handleManual);
+  server.on("/connect", HTTP_POST, handleConnect);
+  server.onNotFound([]() {
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "");
+  });
+
+  server.begin();
+}
+
+// ------------------ SETUP ------------------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  esp_log_level_set("wifi",     ESP_LOG_WARN);
+  esp_log_level_set("wifi_udp", ESP_LOG_WARN);
+
+  pinMode(LED_PIN, OUTPUT);
+  setLedOff();
+
+  Serial.println();
+  Serial.println("[BOOT] ESP32 Starting...");
+
+  hasSavedCredentials = loadSavedCredentials();
+
+  if (hasSavedCredentials) {
+    startWifiConnectBlockingFirstAttempt();
+    if (wifiState == WIFI_STATE_AP) {
+      startAPMode();
+    }
+  } else {
+    wifiState = WIFI_STATE_AP;
+    startAPMode();
+  }
+}
+
+// ------------------ LOOP ------------------
+void loop() {
+  // Serial factory reset
+  if (Serial.available()) {
+    String cmd = Serial.readString();
+    cmd.trim();
+    if (cmd == "reset") {
+      Serial.println("[SERIAL] Factory reset command");
+      factoryReset();
+    }
+  }
+
+  switch (wifiState) {
+    case WIFI_STATE_CONNECTING: {
+      handleWifiConnecting();
+      break;
+    }
+
+    case WIFI_STATE_CONNECTED: {
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WIFI] Lost connection, starting reconnect...");
+        wifiState       = WIFI_STATE_CONNECTING;
+        wifiRetries     = 0;
+        lastWifiAttempt = millis();
+
+        WiFi.disconnect();
+        delay(100);
+        WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+        delay(200);
+        break;
+      }
+
+      ensureMqttConnected();
+      client.loop();
+
+      if (millis() - lastHeartbeat > 5000) {
+        lastHeartbeat = millis();
+        client.publish(topic_led_status, "Device Alive");
+      }
+      break;
+    }
+
+    case WIFI_STATE_AP: {
+      dnsServer.processNextRequest();
+      server.handleClient();
+
+      static unsigned long lastBlink = 0;
+      static bool ledState = false;
+      if (millis() - lastBlink > 200) {
+        lastBlink = millis();
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? LOW : HIGH);
+      }
+      break;
+    }
+  }
+}

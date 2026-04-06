@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ESP32 Control Center</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- MQTT.js CDN -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #020617;
+      --bg-alt: #020617;
+      --card: #020617;
+      --card-border: #1f2937;
+      --accent: #3b82f6;
+      --accent-soft: rgba(59, 130, 246, 0.12);
+      --danger: #f97316;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --muted-soft: #6b7280;
+      --success: #22c55e;
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.85);
+      --radius-lg: 22px;
+      --radius-md: 12px;
+      --transition-fast: 0.18s ease-out;
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top, #0f172a 0, #020617 40%, #000 100%);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+    }
+
+    .shell {
+      width: 100%;
+      max-width: 980px;
+      display: grid;
+      grid-template-columns: minmax(0, 3fr) minmax(0, 2.2fr);
+      gap: 20px;
+    }
+
+    @media (max-width: 768px) {
+      .shell {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    .card {
+      background: radial-gradient(circle at top left, rgba(37, 99, 235, 0.18), transparent 55%) var(--bg-alt);
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--card-border);
+      box-shadow: var(--shadow);
+      padding: 20px 22px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: -40%;
+      background: radial-gradient(circle at top, rgba(59,130,246,0.2), transparent 55%);
+      opacity: 0.25;
+      mix-blend-mode: screen;
+      pointer-events: none;
+    }
+
+    .card-inner {
+      position: relative;
+      z-index: 1;
+    }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 14px;
+      gap: 8px;
+    }
+
+    .title {
+      font-size: 1.2rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .title span.icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 26px;
+      border-radius: 999px;
+      background: radial-gradient(circle at 30% 10%, #38bdf8, #3b82f6 45%, #6366f1 100%);
+      box-shadow: 0 0 18px rgba(59,130,246,0.9);
+      font-size: 15px;
+    }
+
+    .badge {
+      font-size: 0.7rem;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.4);
+      color: var(--muted);
+      background: rgba(15, 23, 42, 0.74);
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .badge-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, #22c55e, #16a34a);
+      box-shadow: 0 0 10px rgba(34,197,94,0.9);
+    }
+
+    .badge-disconnected .badge-dot {
+      background: #ef4444;
+      box-shadow: 0 0 9px rgba(248,113,113,0.9);
+    }
+
+    .subtitle {
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+
+    .status-row {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      background: rgba(15,23,42,0.9);
+      border: 1px solid rgba(51,65,85,0.9);
+      color: var(--muted-soft);
+    }
+
+    .pill strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .pill-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--muted-soft);
+    }
+
+    .pill-dot.mqtt-ok {
+      background: var(--success);
+      box-shadow: 0 0 10px rgba(34,197,94,0.8);
+    }
+
+    .pill-dot.mqtt-bad {
+      background: #ef4444;
+      box-shadow: 0 0 10px rgba(248,113,113,0.9);
+    }
+
+    .device-block {
+      display: grid;
+      grid-template-columns: minmax(0, 3fr) minmax(0, 2.2fr);
+      gap: 16px;
+      margin-top: 8px;
+    }
+
+    @media (max-width: 768px) {
+      .device-block {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    /* Toggle */
+
+    .toggle-wrap {
+      padding: 10px;
+      border-radius: var(--radius-md);
+      background: rgba(15,23,42,0.72);
+      border: 1px solid rgba(51,65,85,0.8);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .toggle-text {
+      font-size: 0.8rem;
+    }
+
+    .toggle-label {
+      font-weight: 500;
+      color: var(--text);
+    }
+
+    .toggle-sub {
+      color: var(--muted);
+      margin-top: 2px;
+      font-size: 0.75rem;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-flex;
+      width: 54px;
+      height: 30px;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background-color: #111827;
+      transition: var(--transition-fast);
+      border-radius: 999px;
+      box-shadow: inset 0 0 0 1px rgba(55,65,81,0.9);
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 22px;
+      width: 22px;
+      left: 4px;
+      top: 4px;
+      border-radius: 999px;
+      background: radial-gradient(circle at 30% 10%, #e5e7eb, #d1d5db 40%, #9ca3af 100%);
+      transition: var(--transition-fast);
+      box-shadow: 0 4px 10px rgba(15,23,42,0.9);
+    }
+
+    input:checked + .slider {
+      background: radial-gradient(circle at 20% 20%, #22c55e, #16a34a 40%, #15803d 100%);
+      box-shadow: 0 0 16px rgba(34,197,94,0.7);
+    }
+
+    input:checked + .slider:before {
+      transform: translateX(22px);
+    }
+
+    .slider::after {
+      content: "OFF";
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 0.6rem;
+      color: var(--muted-soft);
+      letter-spacing: 0.06em;
+    }
+
+    input:checked + .slider::after {
+      content: "ON";
+      left: 9px;
+      right: auto;
+    }
+
+    /* Action buttons */
+
+    .btn-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .btn {
+      border-radius: 999px;
+      border: 1px solid transparent;
+      padding: 7px 12px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      cursor: pointer;
+      background: rgba(15,23,42,0.9);
+      color: var(--muted);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: var(--transition-fast);
+    }
+
+    .btn span.icon {
+      font-size: 0.9rem;
+    }
+
+    .btn-primary {
+      background: radial-gradient(circle at 0 0, #3b82f6, #2563eb 40%, #1d4ed8 100%);
+      color: #eff6ff;
+      border-color: rgba(59,130,246,0.5);
+      box-shadow: 0 8px 20px rgba(37,99,235,0.5);
+    }
+
+    .btn-danger {
+      background: radial-gradient(circle at 0 0, #f97316, #ea580c 40%, #c2410c 100%);
+      border-color: rgba(249,115,22,0.6);
+      color: #fff7ed;
+      box-shadow: 0 8px 20px rgba(248,113,22,0.5);
+    }
+
+    .btn-outline {
+      border-color: rgba(75,85,99,0.9);
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 28px rgba(15,23,42,0.9);
+    }
+
+    .btn:active {
+      transform: translateY(0);
+      box-shadow: none;
+    }
+
+    /* Log / activity */
+
+    .log-wrap {
+      padding: 10px;
+      border-radius: var(--radius-md);
+      background: rgba(15,23,42,0.9);
+      border: 1px solid rgba(31,41,55,0.9);
+      margin-top: 12px;
+      height: 120px;
+      display: flex;
+      flex-direction: column;
+      font-size: 0.74rem;
+    }
+
+    .log-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+      color: var(--muted-soft);
+    }
+
+    .log-body {
+      flex: 1;
+      overflow-y: auto;
+      color: var(--muted);
+      padding-right: 4px;
+    }
+
+    .log-line {
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+      margin-bottom: 2px;
+    }
+
+    .log-line strong {
+      color: var(--text);
+    }
+
+    /* Right column: meta */
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+    }
+
+    .meta-item {
+      padding: 10px;
+      border-radius: var(--radius-md);
+      background: rgba(15,23,42,0.88);
+      border: 1px solid rgba(31,41,55,0.92);
+      font-size: 0.8rem;
+    }
+
+    .meta-label {
+      font-size: 0.72rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 4px;
+    }
+
+    .meta-value {
+      font-size: 0.9rem;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .meta-tag {
+      border-radius: 999px;
+      border: 1px solid rgba(75,85,99,0.9);
+      padding: 3px 8px;
+      font-size: 0.7rem;
+      color: var(--muted-soft);
+    }
+
+    .foot-note {
+      font-size: 0.72rem;
+      color: var(--muted-soft);
+      margin-top: 10px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(55,65,81,0.9);
+      font-size: 0.7rem;
+      color: var(--muted-soft);
+    }
+
+    /* ---------- WiFi Manager Modal ---------- */
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(circle at top, rgba(15,23,42,0.9), rgba(0,0,0,0.92));
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease-out;
+      z-index: 50;
+    }
+
+    .modal-backdrop.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .modal {
+      width: 100%;
+      max-width: 420px;
+      border-radius: 20px;
+      border: 1px solid rgba(148,163,184,0.25);
+      background: radial-gradient(circle at top left, rgba(59,130,246,0.2), rgba(15,23,42,0.98));
+      box-shadow: 0 26px 60px rgba(15,23,42,0.95);
+      transform: translateY(12px) scale(0.96);
+      opacity: 0;
+      transition: transform 0.2s ease-out, opacity 0.2s ease-out;
+      padding: 18px 18px 16px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .modal-backdrop.open .modal {
+      transform: translateY(0) scale(1);
+      opacity: 1;
+    }
+
+    .modal::before {
+      content: "";
+      position: absolute;
+      inset: -40%;
+      background: radial-gradient(circle at top, rgba(59,130,246,0.25), transparent 55%);
+      opacity: 0.4;
+      mix-blend-mode: screen;
+      pointer-events: none;
+    }
+
+    .modal-inner {
+      position: relative;
+      z-index: 1;
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .modal-title {
+      font-size: 1rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .modal-title-icon {
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      background: radial-gradient(circle at 30% 10%, #38bdf8, #3b82f6 45%, #6366f1 100%);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      box-shadow: 0 0 14px rgba(59,130,246,0.8);
+    }
+
+    .modal-close {
+      border: none;
+      background: rgba(15,23,42,0.9);
+      border-radius: 999px;
+      width: 28px;
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted-soft);
+      cursor: pointer;
+      font-size: 14px;
+      box-shadow: 0 0 0 1px rgba(55,65,81,0.8);
+      transition: var(--transition-fast);
+    }
+
+    .modal-close:hover {
+      background: rgba(31,41,55,0.95);
+      color: var(--text);
+    }
+
+    .modal-subtitle {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    .field-group {
+      margin-bottom: 10px;
+    }
+
+    .field-label {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 4px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .field-input {
+      width: 100%;
+      border-radius: 999px;
+      border: 1px solid rgba(55,65,81,0.9);
+      padding: 8px 12px;
+      font-size: 0.8rem;
+      background: rgba(15,23,42,0.9);
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.15s ease-out, box-shadow 0.15s ease-out, background 0.15s ease-out;
+    }
+
+    .field-input::placeholder {
+      color: rgba(148,163,184,0.7);
+    }
+
+    .field-input:focus {
+      border-color: rgba(59,130,246,0.9);
+      box-shadow: 0 0 0 1px rgba(37,99,235,0.5);
+      background: rgba(15,23,42,0.95);
+    }
+
+    .field-input.password {
+      letter-spacing: 0.08em;
+    }
+
+    .modal-footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .modal-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .btn-sm {
+      padding: 6px 10px;
+      font-size: 0.72rem;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      border-color: rgba(75,85,99,0.9);
+      color: var(--muted-soft);
+    }
+
+    .modal-status {
+      font-size: 0.74rem;
+      color: var(--muted-soft);
+      min-height: 16px;
+    }
+
+    .modal-status.loading {
+      color: #e5e7eb;
+    }
+
+    .modal-status.success {
+      color: var(--success);
+    }
+
+    .modal-status.error {
+      color: #f97373;
+    }
+
+    .modal-warning {
+      font-size: 0.74rem;
+      color: #fed7aa;
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <!-- LEFT: Control -->
+    <div class="card">
+      <div class="card-inner">
+        <div class="card-header">
+          <div class="title">
+            <span class="icon">⚡</span>
+            ESP32 Control Center
+          </div>
+          <div id="statusBadge" class="badge badge-disconnected">
+            <span class="badge-dot"></span>
+            <span id="statusText">Disconnected</span>
+          </div>
+        </div>
+
+        <div class="subtitle">
+          Live control and monitoring via HiveMQ Cloud. Toggle the onboard LED and manage Wi‑Fi remotely.
+        </div>
+
+        <div class="status-row">
+          <div class="pill">
+            <span class="pill-dot" id="pillMqttDot"></span>
+            <span><strong>MQTT</strong> <span id="pillMqttText">Offline</span></span>
+          </div>
+          <div class="pill">
+            <span class="pill-dot" style="background:#facc15;"></span>
+            <span><strong>Heartbeat</strong> <span id="hbStatus">waiting…</span></span>
+          </div>
+        </div>
+
+        <div class="device-block">
+          <!-- Controls -->
+          <div>
+            <div class="toggle-wrap">
+              <div class="toggle-text">
+                <div class="toggle-label">Onboard LED</div>
+                <div class="toggle-sub" id="ledStateLabel">Unknown</div>
+              </div>
+              <label class="switch">
+                <input type="checkbox" id="toggleLed" onchange="toggleLED()" />
+                <span class="slider"></span>
+              </label>
+            </div>
+
+            <div class="btn-row">
+              <button class="btn btn-primary" onclick="reconnect()">
+                <span class="icon">🔄</span>Reconnect
+              </button>
+              <button class="btn btn-outline" onclick="copyBroker()">
+                <span class="icon">📋</span>Copy Broker URL
+              </button>
+              <!-- Open Wi-Fi Manager modal -->
+              <button class="btn btn-outline" onclick="openWifiModal()">
+                <span class="icon">📶</span>Wi‑Fi Manager
+              </button>
+            </div>
+
+            <div class="log-wrap">
+              <div class="log-header">
+                <span>Activity</span>
+                <button class="btn btn-outline" style="padding:2px 8px;font-size:0.68rem;" onclick="clearLog()">
+                  Clear
+                </button>
+              </div>
+              <div id="logBody" class="log-body">
+                <div class="log-line">Waiting for MQTT connection…</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Meta -->
+          <div>
+            <div class="meta-grid">
+              <div class="meta-item">
+                <div class="meta-label">Broker</div>
+                <div class="meta-value">
+                  <span id="brokerDisplay">–</span>
+                  <span class="meta-tag">HiveMQ Cloud</span>
+                </div>
+              </div>
+              <div class="meta-item">
+                <div class="meta-label">Topics</div>
+                <div class="meta-value" style="flex-direction:column;align-items:flex-start;">
+                  <span class="chip">device/led/control</span>
+                  <span class="chip">device/led/status</span>
+                  <span class="chip">device/wifi/reset</span>
+                  <span class="chip">device/wifi/update</span>
+                </div>
+              </div>
+              <div class="meta-item">
+                <div class="meta-label">Last message</div>
+                <div class="meta-value">
+                  <span id="lastMsgTime">–</span>
+                  <span id="lastMsgTopic" class="meta-tag">–</span>
+                </div>
+              </div>
+            </div>
+            <div class="foot-note">
+              Make sure your ESP32 is online and connected to the same HiveMQ Cloud cluster.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Session / Diagnostics -->
+    <div class="card">
+      <div class="card-inner">
+        <div class="card-header">
+          <div class="title" style="font-size:1rem;">
+            <span class="icon" style="font-size:0.9rem;">📡</span>
+            Session & Diagnostics
+          </div>
+        </div>
+
+        <div class="meta-grid">
+          <div class="meta-item">
+            <div class="meta-label">Client ID</div>
+            <div class="meta-value">
+              <span id="clientId">–</span>
+            </div>
+          </div>
+
+          <div class="meta-item">
+            <div class="meta-label">Connection</div>
+            <div class="meta-value">
+              <span id="connStatus">Disconnected</span>
+              <span id="connUptime" class="meta-tag">–</span>
+            </div>
+          </div>
+
+          <div class="meta-item">
+            <div class="meta-label">Debug</div>
+            <div class="meta-value" style="flex-direction:column;align-items:flex-start;">
+              <span class="chip" id="debugLine1">MQTT.js loaded</span>
+              <span class="chip" id="debugLine2">Waiting for connect()…</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="foot-note">
+          This panel is for monitoring only. Use the left card for real‑time control.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Wi‑Fi Manager Modal -->
+  <div id="wifiModalBackdrop" class="modal-backdrop">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-inner">
+        <div class="modal-header">
+          <div class="modal-title">
+            <span class="modal-title-icon">📶</span>
+            Wi‑Fi Configuration
+          </div>
+          <button class="modal-close" onclick="closeWifiModal()" aria-label="Close Wi‑Fi Manager">✕</button>
+        </div>
+        <div class="modal-subtitle">
+          Update your device Wi‑Fi credentials or trigger a factory reset into setup mode.
+        </div>
+
+        <div class="field-group">
+          <div class="field-label">
+            <span>Wi‑Fi SSID</span>
+          </div>
+          <input
+            id="wifiSsidInput"
+            class="field-input"
+            type="text"
+            placeholder="e.g. MyHome_2.4G"
+            autocomplete="off"
+          />
+        </div>
+
+        <div class="field-group">
+          <div class="field-label">
+            <span>Wi‑Fi Password</span>
+          </div>
+          <input
+            id="wifiPassInput"
+            class="field-input password"
+            type="password"
+            placeholder="Enter Wi‑Fi password"
+            autocomplete="off"
+          />
+        </div>
+
+        <div class="modal-footer">
+          <div class="modal-actions">
+            <button class="btn btn-primary btn-sm" onclick="submitWifiUpdate()">
+              <span class="icon">✅</span>Update Wi‑Fi
+            </button>
+            <button class="btn btn-danger btn-sm" onclick="submitFactoryReset()">
+              <span class="icon">⚠</span>Factory Reset
+            </button>
+            <button class="btn btn-ghost btn-sm" onclick="reconnect()">
+              <span class="icon">🔁</span>Reconnect Device
+            </button>
+          </div>
+          <div>
+            <div id="wifiModalStatus" class="modal-status"></div>
+            <div class="modal-warning">
+              Factory reset will clear saved Wi‑Fi and reboot the device.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ------- CONFIG (match ESP32 + HiveMQ Cloud) -------
+    const brokerUrl = "wss://182af61f63334ba9b5d5d43d70724571.s1.eu.hivemq.cloud:8884/mqtt";
+    const mqttOptions = {
+      username: "harsh",
+      password: "It123456",
+      clean: true,
+      connectTimeout: 4000,
+      reconnectPeriod: 2000
+    };
+
+    const topicLedControl = "device/led/control";
+    const topicLedStatus  = "device/led/status";
+    const topicWifiReset  = "device/wifi/reset";
+    const topicWifiUpdate = "device/wifi/update";
+
+    document.getElementById("brokerDisplay").innerText = brokerUrl;
+
+    // ------- MQTT CLIENT -------
+    const clientId = "WEB_" + Math.floor(Math.random() * 1000000);
+    document.getElementById("clientId").innerText = clientId;
+
+    const client = mqtt.connect(brokerUrl, {
+      ...mqttOptions,
+      clientId
+    });
+
+    let connectedAt = null;
+    let lastHeartbeatTime = 0;
+
+    function log(line) {
+      const logBody = document.getElementById("logBody");
+      const div = document.createElement("div");
+      div.className = "log-line";
+      div.innerHTML = line;
+      logBody.appendChild(div);
+      logBody.scrollTop = logBody.scrollHeight;
+    }
+
+    function clearLog() {
+      const logBody = document.getElementById("logBody");
+      logBody.innerHTML = "";
+      log("Log cleared.");
+    }
+
+    function setStatus(connected) {
+      const badge = document.getElementById("statusBadge");
+      const statusText = document.getElementById("statusText");
+      const pillDot = document.getElementById("pillMqttDot");
+      const pillText = document.getElementById("pillMqttText");
+      const connStatus = document.getElementById("connStatus");
+
+      if (connected) {
+        badge.classList.remove("badge-disconnected");
+        statusText.innerText = "Connected";
+        pillDot.classList.add("mqtt-ok");
+        pillDot.classList.remove("mqtt-bad");
+        pillText.innerText = "Online";
+        connStatus.innerText = "Connected";
+      } else {
+        badge.classList.add("badge-disconnected");
+        statusText.innerText = "Disconnected";
+        pillDot.classList.add("mqtt-bad");
+        pillDot.classList.remove("mqtt-ok");
+        pillText.innerText = "Offline";
+        connStatus.innerText = "Disconnected";
+        document.getElementById("hbStatus").innerText = "waiting…";
+      }
+    }
+
+    function updateUptime() {
+      if (!connectedAt) return;
+      const diff = Math.floor((Date.now() - connectedAt) / 1000);
+      document.getElementById("connUptime").innerText = diff + "s uptime";
+    }
+
+    setInterval(updateUptime, 1000);
+
+    // ------- MQTT EVENTS -------
+    client.on("connect", () => {
+      connectedAt = Date.now();
+      setStatus(true);
+      log(`<strong>MQTT:</strong> Connected as ${clientId}`);
+      document.getElementById("debugLine1").innerText = "MQTT connected";
+      document.getElementById("debugLine2").innerText = "Subscribed to device topics";
+
+      client.subscribe(topicLedStatus, (err) => {
+        if (!err) {
+          log("Subscribed: " + topicLedStatus);
+        } else {
+          log("Subscribe error: " + err.message);
+        }
+      });
+    });
+
+    client.on("reconnect", () => {
+      log("Reconnecting…");
+      document.getElementById("debugLine2").innerText = "Reconnecting…";
+    });
+
+    client.on("close", () => {
+      setStatus(false);
+      log("Connection closed.");
+    });
+
+    client.on("error", (err) => {
+      setStatus(false);
+      log("Error: " + err.message);
+      document.getElementById("debugLine2").innerText = "Error: " + err.message;
+    });
+
+    client.on("message", (topic, message) => {
+      const msg = message.toString();
+      const time = new Date().toLocaleTimeString();
+      document.getElementById("lastMsgTime").innerText = time;
+      document.getElementById("lastMsgTopic").innerText = topic;
+
+      log(`<strong>${topic}</strong>: ${msg}`);
+
+      if (topic === topicLedStatus) {
+        if (msg === "LED ON") {
+          document.getElementById("toggleLed").checked = true;
+          document.getElementById("ledStateLabel").innerText = "LED is ON";
+        } else if (msg === "LED OFF") {
+          document.getElementById("toggleLed").checked = false;
+          document.getElementById("ledStateLabel").innerText = "LED is OFF";
+        } else if (msg === "Device Alive") {
+          lastHeartbeatTime = Date.now();
+          document.getElementById("hbStatus").innerText = "ok (" + time + ")";
+        } else {
+          document.getElementById("hbStatus").innerText = msg;
+        }
+      }
+    });
+
+    // Heartbeat freshness indicator
+    setInterval(() => {
+      if (!lastHeartbeatTime) return;
+      const diff = Math.floor((Date.now() - lastHeartbeatTime) / 1000);
+      if (diff > 20) {
+        document.getElementById("hbStatus").innerText = "stale (" + diff + "s ago)";
+      }
+    }, 4000);
+
+    // ------- ACTIONS -------
+    function toggleLED() {
+      const state = document.getElementById("toggleLed").checked;
+      if (!client.connected) return;
+      const payload = state ? "ON" : "OFF";
+      client.publish(topicLedControl, payload);
+      log("Publish: " + topicLedControl + " → " + payload);
+    }
+
+    function resetWifiLegacy() {
+      if (!client.connected) return;
+      if (!confirm("Send Wi‑Fi reset to ESP32? It will clear saved Wi‑Fi and reboot.")) return;
+      client.publish(topicWifiReset, "RESET");
+      log("Publish: " + topicWifiReset + " → RESET");
+    }
+
+    // Keep old button wired, but you can remove if you only want modal usage
+    function resetWifi() {
+      openWifiModal();
+    }
+
+    function reconnect() {
+      if (client.connected) {
+        log("Already connected.");
+        return;
+      }
+      log("Manual reconnect requested.");
+      client.reconnect();
+    }
+
+    function copyBroker() {
+      navigator.clipboard.writeText(brokerUrl).then(() => {
+        log("Broker URL copied to clipboard.");
+      }).catch(() => {
+        log("Clipboard copy failed.");
+      });
+    }
+
+    // ------- Wi‑Fi Modal Logic -------
+    const wifiModalBackdrop = document.getElementById("wifiModalBackdrop");
+    const wifiModalStatus   = document.getElementById("wifiModalStatus");
+    const wifiSsidInput     = document.getElementById("wifiSsidInput");
+    const wifiPassInput     = document.getElementById("wifiPassInput");
+
+    function openWifiModal() {
+      wifiModalBackdrop.classList.add("open");
+      wifiModalStatus.textContent = "";
+      wifiModalStatus.className = "modal-status";
+      wifiSsidInput.focus();
+    }
+
+    function closeWifiModal() {
+      wifiModalBackdrop.classList.remove("open");
+    }
+
+    wifiModalBackdrop.addEventListener("click", () => {
+      closeWifiModal();
+    });
+
+    function setWifiStatus(text, type) {
+      wifiModalStatus.textContent = text;
+      wifiModalStatus.className = "modal-status " + (type || "");
+    }
+
+    function submitWifiUpdate() {
+      if (!client.connected) {
+        setWifiStatus("Not connected to MQTT.", "error");
+        return;
+      }
+
+      const ssid = wifiSsidInput.value.trim();
+      const password = wifiPassInput.value.trim();
+
+      if (!ssid || !password) {
+        setWifiStatus("SSID and password are required.", "error");
+        return;
+      }
+
+      const payload = JSON.stringify({ ssid, password });
+      setWifiStatus("Updating Wi‑Fi…", "loading");
+      client.publish(topicWifiUpdate, payload, { qos: 1 }, (err) => {
+        if (err) {
+          setWifiStatus("Failed to publish Wi‑Fi update.", "error");
+          log("Wi‑Fi update publish error: " + err.message);
+        } else {
+          setWifiStatus("Wi‑Fi update sent. Device will reconnect.", "success");
+          log("Publish: " + topicWifiUpdate + " → " + payload);
+        }
+      });
+    }
+
+    function submitFactoryReset() {
+      if (!client.connected) {
+        setWifiStatus("Not connected to MQTT.", "error");
+        return;
+      }
+
+      const ok = confirm("Factory reset will clear Wi‑Fi and reboot into setup mode.\nContinue?");
+      if (!ok) return;
+
+      setWifiStatus("Sending factory reset…", "loading");
+      client.publish(topicWifiReset, "reset", { qos: 1 }, (err) => {
+        if (err) {
+          setWifiStatus("Failed to send reset.", "error");
+          log("Wi‑Fi reset publish error: " + err.message);
+        } else {
+          setWifiStatus("Reset command sent. Device will reboot.", "success");
+          log("Publish: " + topicWifiReset + " → reset");
+        }
+      });
+    }
+
+    // Expose functions to global scope
+    window.toggleLED = toggleLED;
+    window.resetWifi = resetWifi;
+    window.reconnect = reconnect;
+    window.clearLog = clearLog;
+    window.copyBroker = copyBroker;
+    window.openWifiModal = openWifiModal;`
+    window.closeWifiModal = closeWifiModal;
+    window.submitWifiUpdate = submitWifiUpdate;
+    window.submitFactoryReset = submitFactoryReset;
+  </script>
+</body>
+</html>
