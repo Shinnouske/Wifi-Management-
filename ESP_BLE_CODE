@@ -1,0 +1,201 @@
+#include "BluetoothSerial.h"
+#include "WiFi.h"
+#include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+// ===== BT + WIFI =====
+BluetoothSerial SerialBT;
+Preferences prefs;
+
+String ssid = "", password = "";
+
+bool connecting = false;
+unsigned long connectStart = 0;
+
+// ===== MQTT =====
+const char* mqtt_server = "182af61f63334ba9b5d5d43d70724571.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "bluetooth";
+const char* mqtt_pass = "Ble_12345";
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+// ===== LED =====
+#define LED_PIN 2
+
+// ===== RESET BUTTON =====
+#define RESET_BUTTON 4
+bool buttonPressed = false;
+unsigned long buttonPressTime = 0;
+const unsigned long RESET_HOLD_TIME = 3000;
+
+// ===== MQTT CALLBACK =====
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  Serial.println("MQTT Msg: " + msg);
+
+  if (msg == "ON") digitalWrite(LED_PIN, HIGH);
+  if (msg == "OFF") digitalWrite(LED_PIN, LOW);
+}
+
+// ===== MQTT CONNECT =====
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting MQTT...");
+
+    if (client.connect("ESP32Client", mqtt_user, mqtt_pass)) {
+      Serial.println("Connected");
+      client.subscribe("esp32/led");
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(RESET_BUTTON, INPUT_PULLUP);
+
+  prefs.begin("wifi", false);
+
+  if (prefs.isKey("ssid")) {
+    ssid = prefs.getString("ssid", "");
+    password = prefs.getString("pass", "");
+
+    Serial.println("Found saved WiFi:");
+    Serial.println("SSID: " + ssid);
+
+    connectWiFi();
+  } else {
+    SerialBT.begin("ESP32_Prov");
+    Serial.println("Bluetooth provisioning ready...");
+  }
+
+  prefs.end();
+
+  // MQTT setup
+  espClient.setInsecure();  // TLS bypass
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+}
+
+// ===== LOOP =====
+void loop() {
+  handleResetButton();
+
+  // ===== BLUETOOTH =====
+  if (SerialBT.available()) {
+    String cmd = SerialBT.readStringUntil('\n');
+    cmd.trim();
+
+    Serial.println("Received: [" + cmd + "]");
+
+    if (cmd.startsWith("SSID:")) {
+      ssid = cmd.substring(5);
+      ssid.trim();
+      SerialBT.println("SSID OK");
+
+    } else if (cmd.startsWith("PASS:")) {
+      password = cmd.substring(5);
+      password.trim();
+
+      saveWiFi();
+      SerialBT.println("Connecting...");
+      connectWiFi();
+
+    } else if (cmd == "RESET") {
+      factoryReset();
+    }
+  }
+
+  // ===== WIFI STATUS =====
+  if (connecting) {
+    int status = WiFi.status();
+
+    if (status == WL_CONNECTED) {
+      connecting = false;
+
+      String ip = WiFi.localIP().toString();
+      Serial.println("✅ Connected! IP: " + ip);
+      SerialBT.println("CONNECTED: " + ip);
+
+    } else if (millis() - connectStart > 20000) {
+      connecting = false;
+      Serial.println("❌ Timeout");
+      WiFi.disconnect(true, true);
+    }
+  }
+
+  // ===== MQTT LOOP =====
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!client.connected()) {
+      reconnectMQTT();
+    }
+    client.loop();
+  }
+
+  delay(200);
+}
+
+// ===== WIFI CONNECT =====
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(1000);
+
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  connecting = true;
+  connectStart = millis();
+}
+
+// ===== SAVE =====
+void saveWiFi() {
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", password);
+  prefs.end();
+}
+
+// ===== RESET =====
+void factoryReset() {
+  prefs.begin("wifi", false);
+  prefs.clear();
+  prefs.end();
+
+  WiFi.disconnect(true, true);
+  SerialBT.end();
+
+  delay(1000);
+  ESP.restart();
+}
+
+// ===== BUTTON =====
+void handleResetButton() {
+  bool state = !digitalRead(RESET_BUTTON);
+
+  if (state && !buttonPressed) {
+    buttonPressed = true;
+    buttonPressTime = millis();
+  }
+
+  if (!state && buttonPressed) {
+    buttonPressed = false;
+  }
+
+  if (buttonPressed && (millis() - buttonPressTime > RESET_HOLD_TIME)) {
+    factoryReset();
+  }
+}
