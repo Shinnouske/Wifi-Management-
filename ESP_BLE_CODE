@@ -3,104 +3,214 @@
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include <time.h>
 
-// ===== BT + WIFI =====
 BluetoothSerial SerialBT;
 Preferences prefs;
 
 String ssid = "", password = "";
 
-bool connecting = false;
-unsigned long connectStart = 0;
+bool haveWifiCreds = false;
 
-// ===== MQTT =====
+// MQTT Config for HiveMQ Cloud
 const char* mqtt_server = "182af61f63334ba9b5d5d43d70724571.s1.eu.hivemq.cloud";
-const int mqtt_port = 8883;
-const char* mqtt_user = "bluetooth";
-const char* mqtt_pass = "Ble_12345";
+const int   mqtt_port   = 8883;
+const char* mqtt_user   = "bluetooth";
+const char* mqtt_pass   = "Ble_12345";
 
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
-// ===== LED =====
+// LED Control
 #define LED_PIN 2
 
-// ===== RESET BUTTON =====
+// Reset Button
 #define RESET_BUTTON 4
 bool buttonPressed = false;
 unsigned long buttonPressTime = 0;
 const unsigned long RESET_HOLD_TIME = 3000;
 
-// ===== MQTT CALLBACK =====
+// Time Sync Flag
+bool timeSynced = false;
+
+// BLE state
+bool bleActive = false;
+
+// ===== MQTT Callback for LED Control =====
 void callback(char* topic, byte* payload, unsigned int length) {
   String msg;
-
   for (int i = 0; i < length; i++) {
     msg += (char)payload[i];
   }
+  msg.trim();
 
-  Serial.println("MQTT Msg: " + msg);
+  Serial.println("MQTT RX: " + msg);
 
-  if (msg == "ON") digitalWrite(LED_PIN, HIGH);
-  if (msg == "OFF") digitalWrite(LED_PIN, LOW);
-}
-
-// ===== MQTT CONNECT =====
-void reconnectMQTT() {
-  while (!client.connected()) {
-    Serial.print("Connecting MQTT...");
-
-    if (client.connect("ESP32Client", mqtt_user, mqtt_pass)) {
-      Serial.println("Connected");
-      client.subscribe("esp32/led");
-    } else {
-      Serial.print("Failed, rc=");
-      Serial.println(client.state());
-      delay(2000);
-    }
+  if (msg == "ON") {
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("LED ON");
+  } else if (msg == "OFF") {
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("LED OFF");
   }
 }
 
-// ===== SETUP =====
-void setup() {
-  Serial.begin(115200);
+// ===== Improved NTP Time Sync (blocking) =====
+void syncTimeBlocking() {
+  if (timeSynced) return;
 
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(RESET_BUTTON, INPUT_PULLUP);
+  Serial.println("NTP: starting (in.pool.ntp.org)");
+  // Use regional pool for better latency
+  configTime(0, 0, "in.pool.ntp.org");  // or "pool.ntp.org"
 
-  prefs.begin("wifi", false);
+  const unsigned long maxWaitMs   = 25000;  // wait up to 25s
+  const unsigned long intervalMs  = 500;
+  unsigned long start = millis();
 
-  if (prefs.isKey("ssid")) {
-    ssid = prefs.getString("ssid", "");
-    password = prefs.getString("pass", "");
+  time_t now = time(nullptr);
+  while ((now < 8 * 3600 * 2) && (millis() - start < maxWaitMs)) {
+    delay(intervalMs);
+    Serial.print(".");
+    now = time(nullptr);
+  }
 
-    Serial.println("Found saved WiFi:");
-    Serial.println("SSID: " + ssid);
-
-    connectWiFi();
+  if (now >= 8 * 3600 * 2) {
+    Serial.println(" NTP OK");
+    Serial.print("Time: ");
+    Serial.println(ctime(&now));
+    timeSynced = true;
   } else {
-    SerialBT.begin("ESP32_Prov");
-    Serial.println("Bluetooth provisioning ready...");
+    Serial.println(" NTP FAIL");
+  }
+}
+
+// ===== WiFi connect (blocking, like your test sketch) =====
+void connectWiFiBlocking() {
+  Serial.println("WiFi connect...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(1000);
+
+  WiFi.begin(ssid.c_str(), password.c_str());
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 40) {
+    delay(500);
+    Serial.print(".");
+    retry++;
   }
 
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi OK, IP: " + WiFi.localIP().toString());
+    // IMPORTANT: small delay to let DNS stack settle
+    delay(1500);
+    // Now do NTP once, blocking, right after WiFi is up
+    syncTimeBlocking();
+  } else {
+    Serial.println("\nWiFi FAIL");
+  }
+}
+
+// ===== Save Credentials =====
+void saveWiFi() {
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", password);
+  prefs.end();
+  Serial.println("WiFi Saved");
+}
+
+// ===== Stop BLE after provisioning =====
+void stopBLE() {
+  if (bleActive) {
+    Serial.println("Stopping BLE");
+    SerialBT.disconnect();
+    SerialBT.end();
+    bleActive = false;
+  }
+}
+
+// ===== Factory Reset =====
+void factoryReset() {
+  Serial.println("Factory Reset");
+  prefs.begin("wifi", false);
+  prefs.clear();
   prefs.end();
 
-  // MQTT setup
-  espClient.setInsecure();  // TLS bypass
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(callback);
+  WiFi.disconnect(true, true);
+  if (bleActive) {
+    SerialBT.end();
+  }
+  delay(2000);
+  ESP.restart();
 }
 
-// ===== LOOP =====
+// ===== Hardware Reset Button Handler =====
+void handleResetButton() {
+  bool pressed = !digitalRead(RESET_BUTTON);
+
+  if (pressed && !buttonPressed) {
+    buttonPressed = true;
+    buttonPressTime = millis();
+  } else if (!pressed && buttonPressed) {
+    buttonPressed = false;
+  }
+
+  if (buttonPressed && (millis() - buttonPressTime > RESET_HOLD_TIME)) {
+    factoryReset();
+  }
+}
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(RESET_BUTTON, INPUT_PULLUP);
+
+  Serial.println("=== BLE + WiFi + MQTT (with fixed NTP) ===");
+
+  // Load Saved WiFi Credentials
+  prefs.begin("wifi", false);
+  if (prefs.isKey("ssid")) {
+    ssid     = prefs.getString("ssid", "");
+    password = prefs.getString("pass", "");
+    haveWifiCreds = true;
+    Serial.println("Found WiFi: " + ssid);
+  } else {
+    haveWifiCreds = false;
+  }
+  prefs.end();
+
+  if (!haveWifiCreds) {
+    // No WiFi saved: enable BLE provisioning
+    SerialBT.begin("ESP32_Prov");
+    bleActive = true;
+    Serial.println("No WiFi saved. Use BLE: SSID:name PASS:pass");
+  } else {
+    // Have creds: connect WiFi + NTP right now (blocking)
+    connectWiFiBlocking();
+    // BLE not started in this path
+  }
+
+  // MQTT/TLS Setup (unchanged)
+  espClient.setInsecure();  // For HiveMQ Cloud
+  espClient.setTimeout(20);
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  client.setBufferSize(1024);
+  client.setKeepAlive(120);
+  client.setSocketTimeout(20);
+}
+
+// ===== Loop =====
 void loop() {
   handleResetButton();
 
-  // ===== BLUETOOTH =====
-  if (SerialBT.available()) {
+  // ===== BLE Provisioning (only when active) =====
+  if (bleActive && SerialBT.available()) {
     String cmd = SerialBT.readStringUntil('\n');
     cmd.trim();
-
-    Serial.println("Received: [" + cmd + "]");
+    Serial.println("BLE RX: " + cmd);
 
     if (cmd.startsWith("SSID:")) {
       ssid = cmd.substring(5);
@@ -110,92 +220,56 @@ void loop() {
     } else if (cmd.startsWith("PASS:")) {
       password = cmd.substring(5);
       password.trim();
-
       saveWiFi();
-      SerialBT.println("Connecting...");
-      connectWiFi();
+      SerialBT.println("Saved! Connecting...");
+
+      // After provisioning, run the same blocking WiFi + NTP flow
+      connectWiFiBlocking();
+      if (WiFi.status() == WL_CONNECTED && timeSynced) {
+        SerialBT.println("Provision done, disabling BLE");
+        stopBLE();
+        haveWifiCreds = true;
+      }
 
     } else if (cmd == "RESET") {
       factoryReset();
+
+    } else if (cmd == "STATUS") {
+      String status = "WiFi:" + String(WiFi.status() == WL_CONNECTED ? "OK" : "NO");
+      if (WiFi.status() == WL_CONNECTED) {
+        status += "|IP:" + WiFi.localIP().toString();
+        status += "|RSSI:" + String(WiFi.RSSI());
+      }
+      status += "|MQTT:" + String(client.connected() ? "OK" : "NO");
+      status += "|Time:" + String(timeSynced ? "OK" : "NO");
+      SerialBT.println(status);
     }
   }
 
-  // ===== WIFI STATUS =====
-  if (connecting) {
-    int status = WiFi.status();
-
-    if (status == WL_CONNECTED) {
-      connecting = false;
-
-      String ip = WiFi.localIP().toString();
-      Serial.println("✅ Connected! IP: " + ip);
-      SerialBT.println("CONNECTED: " + ip);
-
-    } else if (millis() - connectStart > 20000) {
-      connecting = false;
-      Serial.println("❌ Timeout");
-      WiFi.disconnect(true, true);
-    }
-  }
-
-  // ===== MQTT LOOP =====
-  if (WiFi.status() == WL_CONNECTED) {
+  // ===== MQTT: same as your test sketch, but only if timeSynced =====
+  if (WiFi.status() == WL_CONNECTED && timeSynced) {
     if (!client.connected()) {
-      reconnectMQTT();
+      Serial.print("MQTT connect...");
+      uint64_t chipid = ESP.getEfuseMac();
+      char clientId[30];
+      snprintf(clientId, sizeof(clientId), "ESP32-%04X%04X",
+               (uint16_t)(chipid >> 32), (uint16_t)(chipid & 0xFFFF));
+      Serial.print(clientId);
+      Serial.print("...");
+
+      if (client.connect(clientId, mqtt_user, mqtt_pass)) {
+        Serial.println(" OK");
+        client.subscribe("esp32/led");
+        client.publish("esp32/status", "ONLINE");
+      } else {
+        Serial.print(" FAIL, state=");
+        Serial.println(client.state());
+      }
+      delay(5000);
+    } else {
+      client.loop();
     }
-    client.loop();
   }
 
-  delay(200);
-}
-
-// ===== WIFI CONNECT =====
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
-  delay(1000);
-
-  WiFi.begin(ssid.c_str(), password.c_str());
-
-  connecting = true;
-  connectStart = millis();
-}
-
-// ===== SAVE =====
-void saveWiFi() {
-  prefs.begin("wifi", false);
-  prefs.putString("ssid", ssid);
-  prefs.putString("pass", password);
-  prefs.end();
-}
-
-// ===== RESET =====
-void factoryReset() {
-  prefs.begin("wifi", false);
-  prefs.clear();
-  prefs.end();
-
-  WiFi.disconnect(true, true);
-  SerialBT.end();
-
-  delay(1000);
-  ESP.restart();
-}
-
-// ===== BUTTON =====
-void handleResetButton() {
-  bool state = !digitalRead(RESET_BUTTON);
-
-  if (state && !buttonPressed) {
-    buttonPressed = true;
-    buttonPressTime = millis();
-  }
-
-  if (!state && buttonPressed) {
-    buttonPressed = false;
-  }
-
-  if (buttonPressed && (millis() - buttonPressTime > RESET_HOLD_TIME)) {
-    factoryReset();
-  }
+  delay(50);
 }
